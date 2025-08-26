@@ -1,13 +1,12 @@
 fastapi>=0.110
 uvicorn[standard]>=0.27
 openai>=1.40.0
-python-dotenv>=1.0
-langchain
-faiss-cpu==1.8.0.post1
-beautifulsoup4
 requests>=2.31
-transformers>=4.41.0
 sentence-transformers==2.6.1
+faiss-cpu==1.8.0.post1
 numpy>=1.26
 pydantic>=2.6
 torch>=2.3.0
+python-dotenv>=1.0
+langchain
+beautifulsoup4
