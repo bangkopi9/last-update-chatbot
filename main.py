@@ -26,15 +26,37 @@ COMMIT_SHA = os.getenv("COMMIT_SHA", "")
 BUILD_TIME_ISO = os.getenv("BUILD_TIME", datetime.now(timezone.utc).isoformat())
 
 # ========================
-# App & CORS
+# App & CORS (UPDATED)
 # ========================
 app = FastAPI()
+
+# ✅ CORS kini configurable:
+# - ALLOWED_ORIGINS: daftar origin dipisah koma (mis. "https://your-fe.vercel.app,http://localhost:5500")
+# - ALLOWED_ORIGIN_REGEX: regex origin (default mengizinkan semua subdomain vercel.app)
+_ALLOWED = os.getenv("ALLOWED_ORIGINS", "").strip()
+_ALLOWED_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", r"^https://.*\.vercel\.app$").strip()
+
+if _ALLOWED:
+    _origins = [o.strip() for o in _ALLOWED.split(",") if o.strip()]
+    # Jika kamu memang butuh cookie/session lintas origin, biarkan True.
+    # Kalau tidak, False lebih aman.
+    _allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").lower() == "true"
+else:
+    # Default aman untuk dev: izinkan localhost.
+    # (Untuk production, set ALLOWED_ORIGINS dengan domain FE kamu.)
+    _origins = ["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5500"]
+    _allow_credentials = False
+
+# Jika ada "*" di origins, credentials HARUS False menurut spesifikasi CORS.
+if any(o == "*" for o in _origins):
+    _allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*\.vercel\.app$",
-    allow_origins=["*", "http://localhost:3000"],  # TODO prod: batasi ke domain kamu
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=_origins,
+    allow_origin_regex=_ALLOWED_REGEX if _ALLOWED_REGEX else None,
+    allow_credentials=_allow_credentials,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
