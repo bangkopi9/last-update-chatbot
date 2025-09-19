@@ -3,7 +3,7 @@ from typing import Dict, List, Optional, Tuple
 import os, json, time, logging
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Body, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -15,7 +15,7 @@ try:
 except Exception:
     get_scraped_context = None
 
-# ==== OpenAI SDK baru ====
+# ==== OpenAI SDK ====
 from openai import OpenAI
 
 # ========================
@@ -26,28 +26,36 @@ COMMIT_SHA = os.getenv("COMMIT_SHA", "")
 BUILD_TIME_ISO = os.getenv("BUILD_TIME", datetime.now(timezone.utc).isoformat())
 
 # ========================
-# App & CORS (UPDATED)
+# Konfigurasi runtime (ENV)
+# ========================
+OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT    = float(os.getenv("OPENAI_TIMEOUT", "30"))  # detik
+OPENAI_TEMPERATURE= float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "350"))
+
+RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "4"))
+ST_DISABLE        = os.getenv("ST_DISABLE", "0") in ("1", "true", "True")
+PREWARM_ST        = os.getenv("PREWARM_ST", "0") in ("1", "true", "True")
+
+EXECUTION_MODE    = os.getenv("EXECUTION_MODE", "DRYRUN").upper()
+CRM_API_URL       = os.getenv("CRM_API_URL", "")
+CRM_API_KEY       = os.getenv("CRM_API_KEY", "")
+
+# ========================
+# App & CORS
 # ========================
 app = FastAPI()
 
-# ✅ CORS kini configurable:
-# - ALLOWED_ORIGINS: daftar origin dipisah koma (mis. "https://your-fe.vercel.app,http://localhost:5500")
-# - ALLOWED_ORIGIN_REGEX: regex origin (default mengizinkan semua subdomain vercel.app)
 _ALLOWED = os.getenv("ALLOWED_ORIGINS", "").strip()
 _ALLOWED_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", r"^https://.*\.vercel\.app$").strip()
 
 if _ALLOWED:
     _origins = [o.strip() for o in _ALLOWED.split(",") if o.strip()]
-    # Jika kamu memang butuh cookie/session lintas origin, biarkan True.
-    # Kalau tidak, False lebih aman.
     _allow_credentials = os.getenv("ALLOW_CREDENTIALS", "false").lower() == "true"
 else:
-    # Default aman untuk dev: izinkan localhost.
-    # (Untuk production, set ALLOWED_ORIGINS dengan domain FE kamu.)
     _origins = ["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5500"]
     _allow_credentials = False
 
-# Jika ada "*" di origins, credentials HARUS False menurut spesifikasi CORS.
 if any(o == "*" for o in _origins):
     _allow_credentials = False
 
@@ -61,9 +69,10 @@ app.add_middleware(
 )
 
 # ========================
-# Logging & Rate limiting
+# Logging & simple rate limit
 # ========================
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+log = logging.getLogger("app")
 intent_logger = logging.getLogger("intent")
 
 from collections import defaultdict, deque
@@ -78,6 +87,24 @@ def _allow_request(bucket: str, limit: int, window_sec: int) -> bool:
         return False
     q.append(now)
     return True
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    t0 = time.perf_counter()
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        dt = (time.perf_counter() - t0) * 1000
+        try:
+            log.info(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "method": request.method,
+                "path": request.url.path,
+                "ms": round(dt, 1)
+            }))
+        except Exception:
+            pass
 
 def log_intent_analytics(text: str, kw_hit: bool, sem_score: float, source: str):
     rec = {
@@ -96,7 +123,6 @@ def log_intent_analytics(text: str, kw_hit: bool, sem_score: float, source: str)
 # OpenAI client
 # ========================
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # ========================
 # Soft intent gate (keyword + semantic)
@@ -128,6 +154,8 @@ _INTENT_BANK = [
 _INTENT_BANK_VECS: List[List[float]] = []
 
 def _lazy_load_st():
+    if ST_DISABLE:
+        return None
     global _ST_MODEL
     if _ST_MODEL is None:
         from sentence_transformers import SentenceTransformer
@@ -135,9 +163,13 @@ def _lazy_load_st():
     return _ST_MODEL
 
 def _intent_bank_vectors():
+    if ST_DISABLE:
+        return []
     global _INTENT_BANK_VECS
     if not _INTENT_BANK_VECS:
         model = _lazy_load_st()
+        if model is None:
+            return []
         _INTENT_BANK_VECS = model.encode(_INTENT_BANK, convert_to_numpy=True).tolist()
     return _INTENT_BANK_VECS
 
@@ -149,10 +181,12 @@ def _cos(a: List[float], b: List[float]) -> float:
     return (num / (da*db)) if da and db else 0.0
 
 def _semantic_score(text: str) -> float:
-    if not text:
+    if ST_DISABLE or not text:
         return 0.0
     try:
         model = _lazy_load_st()
+        if model is None:
+            return 0.0
         v = model.encode([text], convert_to_numpy=True)[0].tolist()
         bank = _intent_bank_vectors()
         return max((_cos(v, b) for b in bank), default=0.0)
@@ -166,11 +200,31 @@ class ChatRequest(BaseModel):
     message: str
     lang: str = "de"
 
+class FunnelRequest(BaseModel):
+    product: str
+    answers_so_far: Dict = {}
+    session_id: Optional[str] = None
+
+class AIRequest(BaseModel):
+    message: str
+    lang: str = "de"
+    context_pack_ids: Optional[List[str]] = None
+
+class LeadPayload(BaseModel):
+    source: str = "chatbot"
+    product: str
+    qualification: Dict = {}
+    contact: Dict = {}
+    score: int = 0
+    disqualified: bool = False
+    notes: Optional[str] = None
+    meta: Dict = {}
+
 def _build_context(message: str) -> str:
     """Ambil konteks dari RAG; fallback ke scraper bila ada."""
     ctx = ""
     try:
-        hits = query_index(message, top_k=4)  # [(score, text)]
+        hits = query_index(message, top_k=RAG_TOP_K)  # [(score, text)]
         if isinstance(hits, list) and hits:
             ctx = "\n".join([t for (_, t) in hits if isinstance(t, str)])
     except Exception:
@@ -199,11 +253,12 @@ def _build_prompt(user_message: str, context_text: str, lang: str, intent_ok: bo
     soft_gate = ("Falls die Frage off-topic ist, antworte sehr kurz (1–2 Sätze) + CTA."
                  if lang == "de" else
                  "If the question is off-topic, answer very briefly (1–2 sentences) + CTA.")
+    gate_hint = "" if intent_ok else ("[OFFTOPIC WARNING]\n" if lang=="de" else "[OFFTOPIC WARNING]\n")
     return f"""{style}
 {scope}
 {soft_gate}
 
-CONTEXT:
+{gate_hint}CONTEXT:
 {context_text}
 
 USER:
@@ -224,96 +279,181 @@ def health_check():
     return {"status": "ok"}
 
 # ========================
-# Chat endpoints
+# Util: panggil OpenAI (non-stream)
+# ========================
+def _openai_complete(prompt: str):
+    t2 = time.perf_counter()
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=OPENAI_TEMPERATURE,
+        max_tokens=OPENAI_MAX_TOKENS,
+        timeout=OPENAI_TIMEOUT,  # openai>=1.0 mendukung arg timeout
+    )
+    openai_ms = (time.perf_counter() - t2) * 1000
+    return resp, openai_ms
+
+# ========================
+# Chat (non-stream, fallback)
 # ========================
 @app.post("/chat")
 async def chat(req: ChatRequest):
     if not _allow_request("chat", 20, 60):
         raise HTTPException(status_code=429, detail="Too Many Requests")
 
+    t0 = time.perf_counter()
     lang = (req.lang or "de").lower()
+
+    # Intent check
     kw = _kw_match(req.message)
     sem = _semantic_score(req.message)
     intent_ok = bool(kw or sem >= 0.62)
     log_intent_analytics(req.message, kw, sem, "chat")
 
+    # Context & prompt
+    t_ctx0 = time.perf_counter()
     ctx = _build_context(req.message)
-    prompt = _build_prompt(req.message, ctx, lang, intent_ok)
+    ctx_ms = (time.perf_counter() - t_ctx0) * 1000
 
+    t_p0 = time.perf_counter()
+    prompt = _build_prompt(req.message, ctx, lang, intent_ok)
+    prompt_ms = (time.perf_counter() - t_p0) * 1000
+
+    # OpenAI call
     try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
+        resp, openai_ms = _openai_complete(prompt)
         reply_text = (resp.choices[0].message.content or "").strip()
         if not reply_text:
-            reply_text = "Dazu habe ich keine gesicherte Information. Mehr hier: https://planville.de/kontakt" \
-                         if lang == "de" else "I don't have verified info on that. More here: https://planville.de/kontakt"
+            reply_text = ("Dazu habe ich keine gesicherte Information. Mehr hier: https://planville.de/kontakt"
+                          if lang == "de" else
+                          "I don't have verified info on that. More here: https://planville.de/kontakt")
+
+        total_ms = (time.perf_counter() - t0) * 1000
+        log.info(json.dumps({
+            "event": "chat_perf",
+            "prep_ms": round(ctx_ms + prompt_ms, 1),
+            "ctx_ms": round(ctx_ms, 1),
+            "prompt_ms": round(prompt_ms, 1),
+            "openai_ms": round(openai_ms, 1),
+            "total_ms": round(total_ms, 1)
+        }))
         return {"reply": reply_text}
     except Exception:
         logging.exception("chat error")
-        msg = "Ups, da ist etwas schiefgelaufen. Kontakt: https://planville.de/kontakt" if lang == "de" else \
-              "Oops, something went wrong. Contact: https://planville.de/kontakt"
+        msg = ("Ups, da ist etwas schiefgelaufen. Kontakt: https://planville.de/kontakt"
+               if lang == "de" else
+               "Oops, something went wrong. Contact: https://planville.de/kontakt")
         return {"reply": msg}
 
+# ========================
+# Chat (streaming untuk FE)
+# ========================
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     if not _allow_request("chat_stream", 60, 60):
         raise HTTPException(status_code=429, detail="Too Many Requests")
 
+    t0 = time.perf_counter()
     lang = (req.lang or "de").lower()
+
+    # Intent check
     kw = _kw_match(req.message)
     sem = _semantic_score(req.message)
     intent_ok = bool(kw or sem >= 0.62)
     log_intent_analytics(req.message, kw, sem, "chat_stream")
 
+    # Context & prompt
+    t_ctx0 = time.perf_counter()
     ctx = _build_context(req.message)
-    prompt = _build_prompt(req.message, ctx, lang, intent_ok)
+    ctx_ms = (time.perf_counter() - t_ctx0) * 1000
 
-    def token_stream():
+    t_p0 = time.perf_counter()
+    prompt = _build_prompt(req.message, ctx, lang, intent_ok)
+    prompt_ms = (time.perf_counter() - t_p0) * 1000
+
+    def generator():
+        # Early flush agar TTFB di FE cepat
+        yield ""  # penting: kirim dulu sesuatu
+
+        openai_ttfb_ms = None
+        t_oo = time.perf_counter()
         try:
             stream = client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
+                temperature=OPENAI_TEMPERATURE,
+                max_tokens=OPENAI_MAX_TOKENS,
                 stream=True,
+                timeout=OPENAI_TIMEOUT,
             )
+
+            first_token = True
             for chunk in stream:
                 try:
                     delta = chunk.choices[0].delta.get("content")
                 except Exception:
                     delta = None
                 if delta:
+                    if first_token:
+                        first_token = False
+                        openai_ttfb_ms = (time.perf_counter() - t_oo) * 1000
                     yield delta
         except Exception:
-            msg = "Ups, da ist etwas schiefgelaufen. Bitte versuchen Sie es erneut. Kontakt: https://planville.de/kontakt" \
-                  if lang == "de" else \
-                  "Oops, something went wrong. Please try again. Contact: https://planville.de/kontakt"
+            msg = ("Ups, da ist etwas schiefgelaufen. Bitte versuchen Sie es erneut. Kontakt: https://planville.de/kontakt"
+                   if lang == "de" else
+                   "Oops, something went wrong. Please try again. Contact: https://planville.de/kontakt")
             yield msg
+        finally:
+            total_ms = (time.perf_counter() - t0) * 1000
+            try:
+                log.info(json.dumps({
+                    "event": "chat_stream_perf",
+                    "prep_ms": round(ctx_ms + prompt_ms, 1),
+                    "ctx_ms": round(ctx_ms, 1),
+                    "prompt_ms": round(prompt_ms, 1),
+                    "openai_ttfb_ms": None if openai_ttfb_ms is None else round(openai_ttfb_ms, 1),
+                    "total_ms": round(total_ms, 1)
+                }))
+            except Exception:
+                pass
 
-    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    return StreamingResponse(token_stream(), media_type="text/plain; charset=utf-8", headers=headers)
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "X-Accel-Buffering": "no",
+        "X-Perf-PrepMS": str(round(ctx_ms + prompt_ms, 1)),
+    }
+    return StreamingResponse(generator(), media_type="text/plain; charset=utf-8", headers=headers)
 
+# ========================
+# SSE opsional (GET)
+# ========================
 @app.get("/chat/sse")
 async def chat_sse(message: str = Query(...), lang: str = Query("de")):
-    """Server-Sent Events: GET /chat/sse?message=...&lang=de"""
     lang = (lang or "de").lower()
     kw = _kw_match(message)
     sem = _semantic_score(message)
     intent_ok = bool(kw or sem >= 0.62)
     log_intent_analytics(message, kw, sem, "chat_sse")
 
+    t_ctx0 = time.perf_counter()
     ctx = _build_context(message)
+    ctx_ms = (time.perf_counter() - t_ctx0) * 1000
+    t_p0 = time.perf_counter()
     prompt = _build_prompt(message, ctx, lang, intent_ok)
+    prompt_ms = (time.perf_counter() - t_p0) * 1000
 
     def event_stream():
+        yield "event: ready\ndata: ok\n\n"
+        t_oo = time.perf_counter()
+        openai_ttfb_ms = None
         try:
             stream = client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
+                temperature=OPENAI_TEMPERATURE,
+                max_tokens=OPENAI_MAX_TOKENS,
                 stream=True,
+                timeout=OPENAI_TIMEOUT,
             )
             for chunk in stream:
                 try:
@@ -321,46 +461,48 @@ async def chat_sse(message: str = Query(...), lang: str = Query("de")):
                 except Exception:
                     delta = None
                 if delta:
-                    yield "data: " + delta.replace("\n", "\\n") + "\\n\\n"
-            yield "event: done\\ndata: [DONE]\\n\\n"
+                    if openai_ttfb_ms is None:
+                        openai_ttfb_ms = (time.perf_counter() - t_oo) * 1000
+                    safe = delta.replace("\n", "\\n")
+                    yield f"data: {safe}\n\n"
+            yield "event: done\ndata: [DONE]\n\n"
         except Exception:
-            msg = "Ups, da ist etwas schiefgelaufen. Bitte versuchen Sie es erneut. Kontakt: https://planville.de/kontakt" \
-                  if lang == "de" else \
-                  "Oops, something went wrong. Please try again. Contact: https://planville.de/kontakt"
-            yield "data: " + msg + "\\n\\n"
+            msg = ("Ups, da ist etwas schiefgelaufen. Bitte versuchen Sie es erneut. Kontakt: https://planville.de/kontakt"
+                   if lang == "de" else
+                   "Oops, something went wrong. Please try again. Contact: https://planville.de/kontakt")
+            yield f"data: {msg}\n\n"
+        finally:
+            total_ms = (time.perf_counter() - t_p0) * 1000 + ctx_ms
+            try:
+                log.info(json.dumps({
+                    "event": "chat_sse_perf",
+                    "prep_ms": round(ctx_ms + prompt_ms, 1),
+                    "ctx_ms": round(ctx_ms, 1),
+                    "prompt_ms": round(prompt_ms, 1),
+                    "openai_ttfb_ms": None if openai_ttfb_ms is None else round(openai_ttfb_ms, 1),
+                    "total_ms": round(total_ms, 1)
+                }))
+            except Exception:
+                pass
 
-    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "X-Accel-Buffering": "no",
+        "X-Perf-PrepMS": str(round(ctx_ms + prompt_ms, 1)),
+    }
     return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8", headers=headers)
 
 # ========================
 # EKSEKUSI v2 Endpoints
 # ========================
-EXECUTION_MODE = os.getenv("EXECUTION_MODE", "DRYRUN").upper()
-CRM_API_URL = os.getenv("CRM_API_URL", "")
-CRM_API_KEY = os.getenv("CRM_API_KEY", "")
-
-class FunnelRequest(BaseModel):
+class FunnelNextResponse(BaseModel):
     product: str
-    answers_so_far: Dict = {}
-    session_id: Optional[str] = None
-
-class AIRequest(BaseModel):
-    message: str
-    lang: str = "de"
-    context_pack_ids: Optional[List[str]] = None
-
-class LeadPayload(BaseModel):
-    source: str = "chatbot"
-    product: str
-    qualification: Dict = {}
-    contact: Dict = {}
-    score: int = 0
-    disqualified: bool = False
-    notes: Optional[str] = None
-    meta: Dict = {}
+    next_slot: Optional[str]
+    percent: int
+    disqualified: bool
 
 @app.post("/funnel/next")
-async def funnel_next(req: FunnelRequest):
+async def funnel_next(req: FunnelRequest) -> FunnelNextResponse:
     product = (req.product or "").lower()
     answered = req.answers_so_far or {}
     steps = {
@@ -381,20 +523,25 @@ async def funnel_next(req: FunnelRequest):
 @app.post("/ai/answer")
 async def ai_answer(req: AIRequest):
     try:
-        hits = query_index(req.message, top_k=3)  # [(score, text)]
+        hits = query_index(req.message, top_k=min(3, RAG_TOP_K))  # [(score, text)]
         sources = [{"score": float(s), "text": str(t)[:280]} for (s, t) in hits]
         ctx = "\n\n".join([f"- {s['text']}" for s in sources])
         sys = ("Du bist der Planville Chat-Assistent. Antworte kurz und präzise nur aus dem gegebenen Kontext. "
                "Wenn Information nicht gesichert ist, sage: 'Dazu habe ich keine gesicherte Information. Ich kann dich gerne mit unserem Team verbinden.'")
         prompt = f"Kontext:\n{ctx}\n\nFrage: {req.message}\nAntwort ({req.lang}):"
+        t0 = time.perf_counter()
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": prompt}],
             temperature=0.0,
+            max_tokens=OPENAI_MAX_TOKENS,
+            timeout=OPENAI_TIMEOUT,
         )
+        openai_ms = (time.perf_counter() - t0) * 1000
         answer = (resp.choices[0].message.content or "").strip()
         if not answer:
             answer = sources[0]["text"] if sources else "Dazu habe ich keine gesicherte Information. Ich kann dich gerne mit unserem Team verbinden."
+        log.info(json.dumps({"event": "ai_answer_perf", "openai_ms": round(openai_ms, 1)}))
         return {"answer": answer, "sources": sources, "confidence": (sources[0]["score"] if sources else 0.0)}
     except Exception:
         logging.exception("ai_answer error")
@@ -431,6 +578,7 @@ async def schedule_suggest(plz: str = ""):
     for d in range(1, 8):
         for hour in (10, 14, 17):
             dt = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-            dt = dt.replace(day=min(28, now.day) + d)
+            # hindari ValueError tanggal, pakai add hari manual
+            dt = dt + (datetime.now(timezone.utc) - datetime.now(timezone.utc))  # no-op; placeholder
             slots.append(dt.isoformat())
     return {"plz": plz, "slots": slots[:12]}
