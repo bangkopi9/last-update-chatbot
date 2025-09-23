@@ -1,11 +1,11 @@
 # main.py
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, AsyncGenerator
 import os, json, time, logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, HTTPException, Body, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 # ==== RAG & (opsional) scraper ====
@@ -21,25 +21,26 @@ from openai import OpenAI
 # ========================
 # Build / Version metadata
 # ========================
-APP_VERSION = os.getenv("APP_VERSION", "dev")
-COMMIT_SHA = os.getenv("COMMIT_SHA", "")
-BUILD_TIME_ISO = os.getenv("BUILD_TIME", datetime.now(timezone.utc).isoformat())
+APP_VERSION   = os.getenv("APP_VERSION", "dev")
+COMMIT_SHA    = os.getenv("COMMIT_SHA", "")
+BUILD_TIME_ISO= os.getenv("BUILD_TIME", datetime.now(timezone.utc).isoformat())
 
 # ========================
 # Konfigurasi runtime (ENV)
 # ========================
-OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TIMEOUT    = float(os.getenv("OPENAI_TIMEOUT", "30"))  # detik
-OPENAI_TEMPERATURE= float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "350"))
+OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT     = float(os.getenv("OPENAI_TIMEOUT", "30"))  # detik
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
+OPENAI_MAX_TOKENS  = int(os.getenv("OPENAI_MAX_TOKENS", "350"))
 
-RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "4"))
-ST_DISABLE        = os.getenv("ST_DISABLE", "0") in ("1", "true", "True")
-PREWARM_ST        = os.getenv("PREWARM_ST", "0") in ("1", "true", "True")
+# ↓ default 3 (lebih ringan)
+RAG_TOP_K          = int(os.getenv("RAG_TOP_K", "3"))
+ST_DISABLE         = os.getenv("ST_DISABLE", "0") in ("1", "true", "True")
+PREWARM_ST         = os.getenv("PREWARM_ST", "1") in ("1", "true", "True")
 
-EXECUTION_MODE    = os.getenv("EXECUTION_MODE", "DRYRUN").upper()
-CRM_API_URL       = os.getenv("CRM_API_URL", "")
-CRM_API_KEY       = os.getenv("CRM_API_KEY", "")
+EXECUTION_MODE     = os.getenv("EXECUTION_MODE", "DRYRUN").upper()
+CRM_API_URL        = os.getenv("CRM_API_URL", "")
+CRM_API_KEY        = os.getenv("CRM_API_KEY", "")
 
 # ========================
 # App & CORS
@@ -120,9 +121,9 @@ def log_intent_analytics(text: str, kw_hit: bool, sem_score: float, source: str)
         pass
 
 # ========================
-# OpenAI client
+# OpenAI client (timeout di konstruktor)
 # ========================
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT)
 
 # ========================
 # Soft intent gate (keyword + semantic)
@@ -253,7 +254,7 @@ def _build_prompt(user_message: str, context_text: str, lang: str, intent_ok: bo
     soft_gate = ("Falls die Frage off-topic ist, antworte sehr kurz (1–2 Sätze) + CTA."
                  if lang == "de" else
                  "If the question is off-topic, answer very briefly (1–2 sentences) + CTA.")
-    gate_hint = "" if intent_ok else ("[OFFTOPIC WARNING]\n" if lang=="de" else "[OFFTOPIC WARNING]\n")
+    gate_hint = "" if intent_ok else ("[OFFTOPIC WARNING]\n")
     return f"""{style}
 {scope}
 {soft_gate}
@@ -279,6 +280,27 @@ def health_check():
     return {"status": "ok"}
 
 # ========================
+# Prewarm on startup
+# ========================
+@app.on_event("startup")
+def _prewarm():
+    if not PREWARM_ST:
+        return
+    try:
+        if not ST_DISABLE:
+            _ = _lazy_load_st()
+            if _ is not None:
+                _.encode(["warmup"], convert_to_numpy=True)
+        # sentuh RAG ringan (abaikan error)
+        try:
+            _ = query_index("warmup", top_k=1)
+        except Exception:
+            pass
+        log.info(json.dumps({"event": "prewarm_done"}))
+    except Exception as e:
+        log.info(json.dumps({"event": "prewarm_skip", "err": str(e)}))
+
+# ========================
 # Util: panggil OpenAI (non-stream)
 # ========================
 def _openai_complete(prompt: str):
@@ -288,7 +310,6 @@ def _openai_complete(prompt: str):
         messages=[{"role": "user", "content": prompt}],
         temperature=OPENAI_TEMPERATURE,
         max_tokens=OPENAI_MAX_TOKENS,
-        timeout=OPENAI_TIMEOUT,  # openai>=1.0 mendukung arg timeout
     )
     openai_ms = (time.perf_counter() - t2) * 1000
     return resp, openai_ms
@@ -373,7 +394,7 @@ async def chat_stream(req: ChatRequest):
 
     def generator():
         # Early flush agar TTFB di FE cepat
-        yield ""  # penting: kirim dulu sesuatu
+        yield ""
 
         openai_ttfb_ms = None
         t_oo = time.perf_counter()
@@ -384,9 +405,7 @@ async def chat_stream(req: ChatRequest):
                 temperature=OPENAI_TEMPERATURE,
                 max_tokens=OPENAI_MAX_TOKENS,
                 stream=True,
-                timeout=OPENAI_TIMEOUT,
             )
-
             first_token = True
             for chunk in stream:
                 try:
@@ -453,7 +472,6 @@ async def chat_sse(message: str = Query(...), lang: str = Query("de")):
                 temperature=OPENAI_TEMPERATURE,
                 max_tokens=OPENAI_MAX_TOKENS,
                 stream=True,
-                timeout=OPENAI_TIMEOUT,
             )
             for chunk in stream:
                 try:
@@ -535,7 +553,6 @@ async def ai_answer(req: AIRequest):
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=OPENAI_MAX_TOKENS,
-            timeout=OPENAI_TIMEOUT,
         )
         openai_ms = (time.perf_counter() - t0) * 1000
         answer = (resp.choices[0].message.content or "").strip()
@@ -573,12 +590,10 @@ async def track(event: Dict = Body(...)):
 
 @app.get("/schedule/suggest")
 async def schedule_suggest(plz: str = ""):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     slots: List[str] = []
     for d in range(1, 8):
         for hour in (10, 14, 17):
-            dt = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-            # hindari ValueError tanggal, pakai add hari manual
-            dt = dt + (datetime.now(timezone.utc) - datetime.now(timezone.utc))  # no-op; placeholder
+            dt = (now + timedelta(days=d)).replace(hour=hour)
             slots.append(dt.isoformat())
     return {"plz": plz, "slots": slots[:12]}
