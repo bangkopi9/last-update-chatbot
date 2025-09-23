@@ -1,25 +1,14 @@
-fastapi==0.110.0
-uvicorn[standard]==0.27.1
-openai==1.40.0
-requests==2.32.3
-
-# RAG stack (SBERT + FAISS). Torch cukup CPU-only.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+openai>=1.40.0
+requests>=2.31
 sentence-transformers==2.6.1
 faiss-cpu==1.8.0.post1
-torch==2.4.1
-
-# Sci stack yang cocok dgn di atas
-numpy==2.0.2
-scipy==1.13.1
-scikit-learn==1.5.2
-
-# Pydantic 2.x karena FastAPI>=0.110 sudah 2.x
-pydantic==2.9.2
-pydantic-core==2.23.4
-
-python-dotenv==1.0.1
-
-# Opsional (pakai kalau benar2 dipakai di code)
-beautifulsoup4==4.12.3
-# langchain SERING bikin build berat/konflik versi; hapus kalau tidak dipakai:
-# langchain==0.2.16
+numpy==1.26.4          # <- PIN penting: faiss-cpu butuh numpy < 2.0
+pydantic>=2.6
+python-dotenv>=1.0
+# Torch akan ditarik otomatis oleh sentence-transformers, biarkan resolver pilih yang cocok
+# (opsional) kalau mau eksplisit, gunakan versi yang aman utk 3.11:
+# torch==2.3.1 ; python_version=="3.11"
+# torch==2.4.1 ; python_version=="3.12"
+beautifulsoup4
