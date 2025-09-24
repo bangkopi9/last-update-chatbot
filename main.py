@@ -120,7 +120,7 @@ def log_intent_analytics(text: str, kw_hit: bool, sem_score: float, source: str)
         pass
 
 # ========================
-# OpenAI client (timeout di konstruktor)
+# OpenAI client (tanpa proxies; timeout didukung 1.x)
 # ========================
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT)
 
@@ -290,7 +290,6 @@ def _prewarm():
             _ = _lazy_load_st()
             if _ is not None:
                 _.encode(["warmup"], convert_to_numpy=True)
-        # sentuh RAG ringan (abaikan error)
         try:
             _ = query_index("warmup", top_k=1)
         except Exception:
@@ -314,7 +313,7 @@ def _openai_complete(prompt: str):
     return resp, openai_ms
 
 # ========================
-# Chat (non-stream, fallback)
+# Chat (non-stream)
 # ========================
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -324,13 +323,11 @@ async def chat(req: ChatRequest):
     t0 = time.perf_counter()
     lang = (req.lang or "de").lower()
 
-    # Intent check
     kw = _kw_match(req.message)
     sem = _semantic_score(req.message)
     intent_ok = bool(kw or sem >= 0.62)
     log_intent_analytics(req.message, kw, sem, "chat")
 
-    # Context & prompt
     t_ctx0 = time.perf_counter()
     ctx = _build_context(req.message)
     ctx_ms = (time.perf_counter() - t_ctx0) * 1000
@@ -339,7 +336,6 @@ async def chat(req: ChatRequest):
     prompt = _build_prompt(req.message, ctx, lang, intent_ok)
     prompt_ms = (time.perf_counter() - t_p0) * 1000
 
-    # OpenAI call
     try:
         resp, openai_ms = _openai_complete(prompt)
         reply_text = (resp.choices[0].message.content or "").strip()
@@ -366,7 +362,7 @@ async def chat(req: ChatRequest):
         return {"reply": msg}
 
 # ========================
-# Chat (streaming NDJSON untuk FE)
+# Chat (streaming NDJSON)
 # ========================
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
@@ -376,13 +372,11 @@ async def chat_stream(req: ChatRequest):
     t0 = time.perf_counter()
     lang = (req.lang or "de").lower()
 
-    # Intent check
     kw = _kw_match(req.message)
     sem = _semantic_score(req.message)
     intent_ok = bool(kw or sem >= 0.62)
     log_intent_analytics(req.message, kw, sem, "chat_stream")
 
-    # Context & prompt
     t_ctx0 = time.perf_counter()
     ctx = _build_context(req.message)
     ctx_ms = (time.perf_counter() - t_ctx0) * 1000
@@ -392,7 +386,7 @@ async def chat_stream(req: ChatRequest):
     prompt_ms = (time.perf_counter() - t_p0) * 1000
 
     def generator():
-        # Early flush + header event
+        # Early flush untuk TTFB
         yield json.dumps({"type": "start"}) + "\n"
 
         openai_ttfb_ms = None
@@ -415,7 +409,6 @@ async def chat_stream(req: ChatRequest):
                     if first:
                         first = False
                         openai_ttfb_ms = (time.perf_counter() - t_oo) * 1000
-                    # kirim per potongan (NDJSON)
                     yield json.dumps({"type": "chunk", "data": delta}) + "\n"
         except Exception:
             msg = ("Ups, da ist etwas schiefgelaufen. Bitte versuchen Sie es erneut. Kontakt: https://planville.de/kontakt"
