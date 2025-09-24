@@ -8,12 +8,14 @@ python-dotenv==1.0.1
 beautifulsoup4==4.12.3
 
 sentence-transformers==2.6.1
+
+# numpy < 2.0 biar aman dg banyak lib native
 numpy==1.26.4
 
-# FAISS yang paling kompatibel di banyak image
-faiss-cpu==1.7.4 ; platform_system == "Linux" and platform_machine == "x86_64"
+# FAISS yang cocok dg Python 3.11 (tersedia di log)
+faiss-cpu==1.12.0
 
-# Torch CPU (kita sudah set PIP_EXTRA_INDEX_URL)
+# Torch CPU (kita sudah kasih extra index PyTorch)
 torch==2.3.1
 
 orjson==3.10.7
