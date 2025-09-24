@@ -1,11 +1,11 @@
 # main.py
-from typing import Dict, List, Optional, Tuple, AsyncGenerator
+from typing import Dict, List, Optional, Tuple
 import os, json, time, logging
 from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, HTTPException, Body, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # ==== RAG & (opsional) scraper ====
@@ -21,34 +21,33 @@ from openai import OpenAI
 # ========================
 # Build / Version metadata
 # ========================
-APP_VERSION   = os.getenv("APP_VERSION", "dev")
-COMMIT_SHA    = os.getenv("COMMIT_SHA", "")
-BUILD_TIME_ISO= os.getenv("BUILD_TIME", datetime.now(timezone.utc).isoformat())
+APP_VERSION    = os.getenv("APP_VERSION", "dev")
+COMMIT_SHA     = os.getenv("COMMIT_SHA", "")
+BUILD_TIME_ISO = os.getenv("BUILD_TIME", datetime.now(timezone.utc).isoformat())
 
 # ========================
 # Konfigurasi runtime (ENV)
 # ========================
-OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TIMEOUT     = float(os.getenv("OPENAI_TIMEOUT", "30"))  # detik
-OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
-OPENAI_MAX_TOKENS  = int(os.getenv("OPENAI_MAX_TOKENS", "350"))
+OPENAI_MODEL        = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT      = float(os.getenv("OPENAI_TIMEOUT", "30"))   # detik
+OPENAI_TEMPERATURE  = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
+OPENAI_MAX_TOKENS   = int(os.getenv("OPENAI_MAX_TOKENS", "350"))
 
-# ↓ default 3 (lebih ringan)
-RAG_TOP_K          = int(os.getenv("RAG_TOP_K", "3"))
-ST_DISABLE         = os.getenv("ST_DISABLE", "0") in ("1", "true", "True")
-PREWARM_ST         = os.getenv("PREWARM_ST", "1") in ("1", "true", "True")
+RAG_TOP_K           = int(os.getenv("RAG_TOP_K", "3"))
+ST_DISABLE          = os.getenv("ST_DISABLE", "0") in ("1", "true", "True")
+PREWARM_ST          = os.getenv("PREWARM_ST", "1") in ("1", "true", "True")
 
-EXECUTION_MODE     = os.getenv("EXECUTION_MODE", "DRYRUN").upper()
-CRM_API_URL        = os.getenv("CRM_API_URL", "")
-CRM_API_KEY        = os.getenv("CRM_API_KEY", "")
+EXECUTION_MODE      = os.getenv("EXECUTION_MODE", "DRYRUN").upper()
+CRM_API_URL         = os.getenv("CRM_API_URL", "")
+CRM_API_KEY         = os.getenv("CRM_API_KEY", "")
 
 # ========================
 # App & CORS
 # ========================
 app = FastAPI()
 
-_ALLOWED = os.getenv("ALLOWED_ORIGINS", "").strip()
-_ALLOWED_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", r"^https://.*\.vercel\.app$").strip()
+_ALLOWED        = os.getenv("ALLOWED_ORIGINS", "").strip()
+_ALLOWED_REGEX  = os.getenv("ALLOWED_ORIGIN_REGEX", r"^https://.*\.vercel\.app$").strip()
 
 if _ALLOWED:
     _origins = [o.strip() for o in _ALLOWED.split(",") if o.strip()]
@@ -58,7 +57,7 @@ else:
     _allow_credentials = False
 
 if any(o == "*" for o in _origins):
-    _allow_credentials = False
+    _allow_credentials = False  # aman untuk wildcard
 
 app.add_middleware(
     CORSMiddleware,
@@ -367,7 +366,7 @@ async def chat(req: ChatRequest):
         return {"reply": msg}
 
 # ========================
-# Chat (streaming untuk FE)
+# Chat (streaming NDJSON untuk FE)
 # ========================
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
@@ -393,8 +392,8 @@ async def chat_stream(req: ChatRequest):
     prompt_ms = (time.perf_counter() - t_p0) * 1000
 
     def generator():
-        # Early flush agar TTFB di FE cepat
-        yield ""
+        # Early flush + header event
+        yield json.dumps({"type": "start"}) + "\n"
 
         openai_ttfb_ms = None
         t_oo = time.perf_counter()
@@ -406,22 +405,23 @@ async def chat_stream(req: ChatRequest):
                 max_tokens=OPENAI_MAX_TOKENS,
                 stream=True,
             )
-            first_token = True
+            first = True
             for chunk in stream:
                 try:
                     delta = chunk.choices[0].delta.get("content")
                 except Exception:
                     delta = None
                 if delta:
-                    if first_token:
-                        first_token = False
+                    if first:
+                        first = False
                         openai_ttfb_ms = (time.perf_counter() - t_oo) * 1000
-                    yield delta
+                    # kirim per potongan (NDJSON)
+                    yield json.dumps({"type": "chunk", "data": delta}) + "\n"
         except Exception:
             msg = ("Ups, da ist etwas schiefgelaufen. Bitte versuchen Sie es erneut. Kontakt: https://planville.de/kontakt"
                    if lang == "de" else
                    "Oops, something went wrong. Please try again. Contact: https://planville.de/kontakt")
-            yield msg
+            yield json.dumps({"type": "error", "data": msg}) + "\n"
         finally:
             total_ms = (time.perf_counter() - t0) * 1000
             try:
@@ -435,13 +435,14 @@ async def chat_stream(req: ChatRequest):
                 }))
             except Exception:
                 pass
+            yield json.dumps({"type": "end"}) + "\n"
 
     headers = {
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "X-Accel-Buffering": "no",
         "X-Perf-PrepMS": str(round(ctx_ms + prompt_ms, 1)),
     }
-    return StreamingResponse(generator(), media_type="text/plain; charset=utf-8", headers=headers)
+    return StreamingResponse(generator(), media_type="application/x-ndjson; charset=utf-8", headers=headers)
 
 # ========================
 # SSE opsional (GET)
@@ -524,9 +525,9 @@ async def funnel_next(req: FunnelRequest) -> FunnelNextResponse:
     product = (req.product or "").lower()
     answered = req.answers_so_far or {}
     steps = {
-        "pv": ["immobilientyp","eigentumer","bewohner","plz","dachform","dachflache_m2","ausrichtung","neigung_deg","verschattung","verbrauch_kwh","batterie","zeitrahmen"],
+        "pv":   ["immobilientyp","eigentumer","bewohner","plz","dachform","dachflache_m2","ausrichtung","neigung_deg","verschattung","verbrauch_kwh","batterie","zeitrahmen"],
         "dach": ["eigentumer","dachform","material","baujahr","zustand","flaeche","neigung","daemmung","plz","zeitrahmen"],
-        "wp":  ["eigentumer","bewohner","gebaeudetyp","baujahr","wohnflaeche","heizung","isolierung","aussenbereich","plz","zeitrahmen"],
+        "wp":   ["eigentumer","bewohner","gebaeudetyp","baujahr","wohnflaeche","heizung","isolierung","aussenbereich","plz","zeitrahmen"],
         "mieterstrom": ["objekttyp","einheiten","zaehler","eigentumer","plz"]
     }
     key = "pv" if "pv" in product else ("dach" if "dach" in product else ("wp" if ("wärme" in product or "wp"==product) else ("mieterstrom" if "mieter" in product else "pv")))
