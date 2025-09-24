@@ -1,4 +1,3 @@
-# ===== CORE APP =====
 fastapi==0.111.0
 uvicorn[standard]==0.30.0
 starlette==0.37.2
@@ -8,15 +7,10 @@ openai==1.40.0
 python-dotenv==1.0.1
 beautifulsoup4==4.12.3
 
-# ===== RAG & EMBEDDINGS =====
 sentence-transformers==2.6.1
-
-# FAISS butuh numpy < 2.0 → PIN keras
 faiss-cpu==1.8.0.post1
 numpy==1.26.4
 
-# ===== TORCH (CPU, Python 3.11) =====
 torch==2.3.1
 
-# (opsional, JSON cepat)
 orjson==3.10.7
