@@ -1,29 +1,16 @@
-# ==========================
-# Core Web Framework
-# ==========================
-fastapi>=0.110
-uvicorn[standard]>=0.27
+fastapi==0.115.6
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
 
-# ==========================
-# OpenAI SDK & HTTP Client
-# ==========================
-openai>=1.40.0
-requests>=2.31
+# OpenAI SDK 1.x + httpx (client custom di main.py)
+openai>=1.40.0,<2.0.0
+httpx>=0.27.2,<0.28
+requests>=2.31,<3
 
-# ==========================
-# Machine Learning / NLP
-# ==========================
-torch>=2.2.0
+# ST untuk intent (boleh matiin via ST_DISABLE=1)
 sentence-transformers==2.6.1
-faiss-cpu==1.8.0.post1
-numpy<2.0  # lock supaya kompatibel dengan faiss
+# Biarkan torch auto-resolve yang cocok untuk platform
+torch>=2.2,<3
 
-# ==========================
-# Data Models & Validation
-# ==========================
-pydantic>=2.6
-
-# ==========================
-# Utils / Optional
-# ==========================
-python-dotenv>=1.0.0     # untuk .env parsing (opsional, local dev)
+# Opsional util
+python-dotenv>=1.0,<2
