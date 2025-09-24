@@ -9,13 +9,13 @@ beautifulsoup4==4.12.3
 
 sentence-transformers==2.6.1
 
-# numpy < 2.0 biar aman dg banyak lib native
-numpy==1.26.4
+# Python 3.13 membutuhkan NumPy >= 2.0
+numpy==2.1.3
 
-# FAISS yang cocok dg Python 3.11 (tersedia di log)
+# FAISS cp313 tersedia -> aman
 faiss-cpu==1.12.0
 
-# Torch CPU (kita sudah kasih extra index PyTorch)
-torch==2.3.1
+# Torch untuk Py3.13 (CPU wheels tersedia di index PyTorch)
+torch==2.8.0+cpu
 
 orjson==3.10.7
