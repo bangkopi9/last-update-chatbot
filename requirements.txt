@@ -1,7 +1,7 @@
 # ===== CORE APP =====
 fastapi==0.111.0
 uvicorn[standard]==0.30.0
-starlette==0.37.2           # mengikuti fastapi 0.111
+starlette==0.37.2
 pydantic==2.6.0
 requests==2.31.0
 openai==1.40.0
@@ -15,12 +15,8 @@ sentence-transformers==2.6.1
 faiss-cpu==1.8.0.post1
 numpy==1.26.4
 
-# ===== TORCH (CPU) =====
-# Catatan:
-# - sentence-transformers butuh torch. Kita pin aman per versi Python:
-# - Railway (Linux, CPU) bisa ambil wheel resmi dari PyPI.
-torch==2.3.1 ; python_version < "3.12"
-torch==2.4.1 ; python_version >= "3.12"
+# ===== TORCH (CPU, Python 3.11) =====
+torch==2.3.1
 
-# (Opsional, tapi aman utk parsing/JSON cepat)
+# (opsional, JSON cepat)
 orjson==3.10.7
