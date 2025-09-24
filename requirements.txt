@@ -1,16 +1,29 @@
-fastapi==0.111.0
-uvicorn==0.30.0
-starlette==0.37.2
-pydantic==2.10.4
-typing-extensions>=4.9.0
-requests==2.31.0
-openai==1.40.0
-python-dotenv==1.0.1
-beautifulsoup4==4.12.3
+# ==========================
+# Core Web Framework
+# ==========================
+fastapi>=0.110
+uvicorn[standard]>=0.27
 
+# ==========================
+# OpenAI SDK & HTTP Client
+# ==========================
+openai>=1.40.0
+requests>=2.31
+
+# ==========================
+# Machine Learning / NLP
+# ==========================
+torch>=2.2.0
 sentence-transformers==2.6.1
-numpy==2.1.3
-faiss-cpu==1.12.0
-torch==2.8.0+cpu
+faiss-cpu==1.8.0.post1
+numpy<2.0  # lock supaya kompatibel dengan faiss
 
-orjson==3.10.7
+# ==========================
+# Data Models & Validation
+# ==========================
+pydantic>=2.6
+
+# ==========================
+# Utils / Optional
+# ==========================
+python-dotenv>=1.0.0     # untuk .env parsing (opsional, local dev)
