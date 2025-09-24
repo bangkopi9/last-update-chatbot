@@ -7,15 +7,16 @@ openai==1.40.0
 python-dotenv==1.0.1
 beautifulsoup4==4.12.3
 
+# RAG stack
 sentence-transformers==2.6.1
 
-# Python 3.13 membutuhkan NumPy >= 2.0
+# Py 3.13 butuh NumPy >= 2.0
 numpy==2.1.3
 
-# FAISS cp313 tersedia -> aman
+# FAISS cp313 tersedia (log kamu sudah mendeteksi wheel cp313)
 faiss-cpu==1.12.0
 
-# Torch untuk Py3.13 (CPU wheels tersedia di index PyTorch)
+# Torch CPU untuk Py 3.13 (wheel ada di index PyTorch)
 torch==2.8.0+cpu
 
 orjson==3.10.7
