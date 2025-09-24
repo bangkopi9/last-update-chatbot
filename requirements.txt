@@ -1,14 +1,19 @@
-fastapi>=0.110
-uvicorn[standard]>=0.27
-openai>=1.40.0
-requests>=2.31
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+starlette==0.37.2
+pydantic==2.6.0
+requests==2.31.0
+openai==1.40.0
+python-dotenv==1.0.1
+beautifulsoup4==4.12.3
+
 sentence-transformers==2.6.1
-faiss-cpu==1.8.0.post1
-numpy==1.26.4          # <- PIN penting: faiss-cpu butuh numpy < 2.0
-pydantic>=2.6
-python-dotenv>=1.0
-# Torch akan ditarik otomatis oleh sentence-transformers, biarkan resolver pilih yang cocok
-# (opsional) kalau mau eksplisit, gunakan versi yang aman utk 3.11:
-# torch==2.3.1 ; python_version=="3.11"
-# torch==2.4.1 ; python_version=="3.12"
-beautifulsoup4
+numpy==1.26.4
+
+# FAISS yang paling kompatibel di banyak image
+faiss-cpu==1.7.4 ; platform_system == "Linux" and platform_machine == "x86_64"
+
+# Torch CPU (kita sudah set PIP_EXTRA_INDEX_URL)
+torch==2.3.1
+
+orjson==3.10.7
