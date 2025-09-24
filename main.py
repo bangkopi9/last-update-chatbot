@@ -15,8 +15,7 @@ try:
 except Exception:
     get_scraped_context = None
 
-# ==== OpenAI SDK (HTTPX client custom) ====
-import httpx
+# ==== OpenAI SDK (tanpa custom httpx) ====
 from openai import OpenAI
 
 # ========================
@@ -121,17 +120,12 @@ def log_intent_analytics(text: str, kw_hit: bool, sem_score: float, source: str)
         pass
 
 # ========================
-# OpenAI client (via httpx.Client) — TANPA 'proxies=' ke OpenAI()
+# OpenAI client
 # ========================
-_proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
-_http_client = httpx.Client(
-    proxies=_proxy,                # kalau None, otomatis diabaikan
-    timeout=OPENAI_TIMEOUT,
-    follow_redirects=True,
-)
+# SDK akan otomatis membaca HTTP(S)_PROXY dari env bila ada — tidak perlu httpx custom.
 client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
-    http_client=_http_client,      # cara resmi di SDK 1.x
+    timeout=OPENAI_TIMEOUT,
 )
 
 # ========================
