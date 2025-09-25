@@ -1,6 +1,6 @@
-# main.py
+# main.py — Planville/Wattson Backend (latency-optimized, p95 terasa ≤ 5 detik)
 from typing import Dict, List, Optional, Tuple
-import os, json, time, logging
+import os, json, time, logging, asyncio
 from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, HTTPException, Body, Query, Request
@@ -31,9 +31,13 @@ BUILD_TIME_ISO = os.getenv("BUILD_TIME", datetime.now(timezone.utc).isoformat())
 OPENAI_MODEL        = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT      = float(os.getenv("OPENAI_TIMEOUT", "30"))   # detik
 OPENAI_TEMPERATURE  = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
-OPENAI_MAX_TOKENS   = int(os.getenv("OPENAI_MAX_TOKENS", "350"))
+# ↓↓↓ Batasi output supaya selesai cepat (target 3–5 dtk)
+OPENAI_MAX_TOKENS   = int(os.getenv("OPENAI_MAX_TOKENS", "110"))
 
 RAG_TOP_K           = int(os.getenv("RAG_TOP_K", "3"))
+# ↓↓↓ Hard cap waktu RAG/scraper agar tidak menahan TTFB/stream
+RAG_TIMEOUT         = float(os.getenv("RAG_TIMEOUT", "0.7"))     # detik
+
 ST_DISABLE          = os.getenv("ST_DISABLE", "0") in ("1", "true", "True")
 PREWARM_ST          = os.getenv("PREWARM_ST", "1") in ("1", "true", "True")
 
@@ -122,7 +126,6 @@ def log_intent_analytics(text: str, kw_hit: bool, sem_score: float, source: str)
 # ========================
 # OpenAI client
 # ========================
-# SDK akan otomatis membaca HTTP(S)_PROXY dari env bila ada — tidak perlu httpx custom.
 client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
     timeout=OPENAI_TIMEOUT,
@@ -224,8 +227,8 @@ class LeadPayload(BaseModel):
     notes: Optional[str] = None
     meta: Dict = {}
 
-def _build_context(message: str) -> str:
-    """Ambil konteks dari RAG; fallback ke scraper bila ada."""
+def _build_context_sync(message: str) -> str:
+    """Ambil konteks dari RAG; fallback ke scraper bila ada. (SINKRON)"""
     ctx = ""
     try:
         hits = query_index(message, top_k=RAG_TOP_K)  # [(score, text)]
@@ -240,7 +243,17 @@ def _build_context(message: str) -> str:
                 ctx = sc
         except Exception:
             pass
-    return ctx
+    # potong keras untuk jaga total token input
+    return (ctx or "")[:8000]
+
+async def _build_context_timeboxed(message: str, timeout_s: float = None) -> str:
+    """Jalankan _build_context_sync di threadpool + timeout ketat agar tidak menahan TTFB/stream."""
+    timeout_s = RAG_TIMEOUT if timeout_s is None else timeout_s
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(None, _build_context_sync, message), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return ""
 
 def _build_prompt(user_message: str, context_text: str, lang: str, intent_ok: bool) -> str:
     cta = "Weitere Fragen? Kontakt: https://planville.de/kontakt" if lang == "de" else \
@@ -327,13 +340,19 @@ async def chat(req: ChatRequest):
     t0 = time.perf_counter()
     lang = (req.lang or "de").lower()
 
+    # Intent check dipersingkat agar tidak memblok
     kw = _kw_match(req.message)
-    sem = _semantic_score(req.message)
+    sem = 0.0
+    try:
+        sem = _semantic_score(req.message) if not ST_DISABLE else 0.0
+    except Exception:
+        sem = 0.0
     intent_ok = bool(kw or sem >= 0.62)
     log_intent_analytics(req.message, kw, sem, "chat")
 
+    # RAG time-boxed
     t_ctx0 = time.perf_counter()
-    ctx = _build_context(req.message)
+    ctx = await _build_context_timeboxed(req.message, RAG_TIMEOUT)
     ctx_ms = (time.perf_counter() - t_ctx0) * 1000
 
     t_p0 = time.perf_counter()
@@ -366,33 +385,44 @@ async def chat(req: ChatRequest):
         return {"reply": msg}
 
 # ========================
-# Chat (streaming NDJSON)
+# Chat (streaming NDJSON) — TTFB < 1s, RAG ≤ 0.7s, token stream cepat
 # ========================
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     if not _allow_request("chat_stream", 60, 60):
         raise HTTPException(status_code=429, detail="Too Many Requests")
 
-    t0 = time.perf_counter()
     lang = (req.lang or "de").lower()
 
-    kw = _kw_match(req.message)
-    sem = _semantic_score(req.message)
-    intent_ok = bool(kw or sem >= 0.62)
-    log_intent_analytics(req.message, kw, sem, "chat_stream")
+    # >>> Jangan lakukan pekerjaan berat di luar generator,
+    #     supaya kita bisa kirim "preface" dulu untuk TTFB cepat.
 
-    t_ctx0 = time.perf_counter()
-    ctx = _build_context(req.message)
-    ctx_ms = (time.perf_counter() - t_ctx0) * 1000
+    async def generator():
+        t0 = time.perf_counter()
 
-    t_p0 = time.perf_counter()
-    prompt = _build_prompt(req.message, ctx, lang, intent_ok)
-    prompt_ms = (time.perf_counter() - t_p0) * 1000
+        # 0) Preface seketika → FE sembunyikan skeleton (TTFB < 1 dtk)
+        yield json.dumps({"type": "preface", "text": "Moment…"}) + "\n"
 
-    def generator():
-        # Early flush untuk TTFB
-        yield json.dumps({"type": "start"}) + "\n"
+        # 1) Soft intent check (tidak menghambat; cepat saja)
+        kw = _kw_match(req.message)
+        try:
+            sem = _semantic_score(req.message) if not ST_DISABLE else 0.0
+        except Exception:
+            sem = 0.0
+        intent_ok = bool(kw or sem >= 0.62)
+        log_intent_analytics(req.message, kw, sem, "chat_stream")
 
+        # 2) RAG time-boxed (≤ RAG_TIMEOUT detik)
+        t_ctx0 = time.perf_counter()
+        ctx = await _build_context_timeboxed(req.message, RAG_TIMEOUT)
+        ctx_ms = (time.perf_counter() - t_ctx0) * 1000
+
+        # 3) Prompt siap (ringkas)
+        t_p0 = time.perf_counter()
+        prompt = _build_prompt(req.message, ctx, lang, intent_ok)
+        prompt_ms = (time.perf_counter() - t_p0) * 1000
+
+        # 4) Mulai stream ke OpenAI — kirim marker "start" lalu token demi token
         openai_ttfb_ms = None
         t_oo = time.perf_counter()
         try:
@@ -404,21 +434,22 @@ async def chat_stream(req: ChatRequest):
                 stream=True,
             )
             first = True
+            yield json.dumps({"type": "start"}) + "\n"
             for chunk in stream:
                 try:
                     delta = chunk.choices[0].delta.get("content")
                 except Exception:
                     delta = None
                 if delta:
-                    if first:
-                        first = False
+                    if openai_ttfb_ms is None:
                         openai_ttfb_ms = (time.perf_counter() - t_oo) * 1000
-                    yield json.dumps({"type": "chunk", "data": delta}) + "\n"
+                    # FE kamu mengharapkan "token" (bukan "chunk")
+                    yield json.dumps({"type": "token", "text": delta}) + "\n"
         except Exception:
             msg = ("Ups, da ist etwas schiefgelaufen. Bitte versuchen Sie es erneut. Kontakt: https://planville.de/kontakt"
                    if lang == "de" else
                    "Oops, something went wrong. Please try again. Contact: https://planville.de/kontakt")
-            yield json.dumps({"type": "error", "data": msg}) + "\n"
+            yield json.dumps({"type": "error", "text": msg}) + "\n"
         finally:
             total_ms = (time.perf_counter() - t0) * 1000
             try:
@@ -432,28 +463,37 @@ async def chat_stream(req: ChatRequest):
                 }))
             except Exception:
                 pass
+            yield json.dumps({"type": "metric", "ttlb": round(total_ms/1000.0, 3)}) + "\n"
             yield json.dumps({"type": "end"}) + "\n"
 
     headers = {
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "X-Accel-Buffering": "no",
-        "X-Perf-PrepMS": str(round(ctx_ms + prompt_ms, 1)),
+        # berguna untuk debugging cepat di FE
+        # "X-Perf-PrepMS": akan di-log via event metric
     }
     return StreamingResponse(generator(), media_type="application/x-ndjson; charset=utf-8", headers=headers)
 
 # ========================
-# SSE opsional (GET)
+# SSE opsional (GET) — dibiarkan, tapi pola sama bisa diterapkan jika dipakai
 # ========================
 @app.get("/chat/sse")
 async def chat_sse(message: str = Query(...), lang: str = Query("de")):
     lang = (lang or "de").lower()
+
+    # (Catatan: endpoint ini jarang dipakai. Bila dipakai, idealnya juga kirim "ready" cepat
+    #  lalu time-box RAG seperti di atas. Untuk singkatnya, kita biarkan mendekati aslinya.)
+
     kw = _kw_match(message)
-    sem = _semantic_score(message)
+    try:
+        sem = _semantic_score(message) if not ST_DISABLE else 0.0
+    except Exception:
+        sem = 0.0
     intent_ok = bool(kw or sem >= 0.62)
     log_intent_analytics(message, kw, sem, "chat_sse")
 
     t_ctx0 = time.perf_counter()
-    ctx = _build_context(message)
+    ctx = await _build_context_timeboxed(message, RAG_TIMEOUT)
     ctx_ms = (time.perf_counter() - t_ctx0) * 1000
     t_p0 = time.perf_counter()
     prompt = _build_prompt(message, ctx, lang, intent_ok)
@@ -509,7 +549,7 @@ async def chat_sse(message: str = Query(...), lang: str = Query("de")):
     return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8", headers=headers)
 
 # ========================
-# EKSEKUSI v2 Endpoints
+# EKSEKUSI v2 Endpoints (dipertahankan)
 # ========================
 class FunnelNextResponse(BaseModel):
     product: str
