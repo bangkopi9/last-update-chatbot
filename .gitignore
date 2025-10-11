@@ -1,1 +1,4 @@
 .env
+.venv
+__pycache__
+backend.local.env
