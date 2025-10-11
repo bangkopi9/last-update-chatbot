@@ -12,5 +12,9 @@ sentence-transformers==2.6.1
 # Biarkan torch auto-resolve yang cocok untuk platform
 torch>=2.2,<3
 
+# Database (PostgreSQL)
+psycopg2-binary>=2.9,<3
+sqlalchemy>=2.0,<3
+
 # Opsional util
 python-dotenv>=1.0,<2

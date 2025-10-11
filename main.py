@@ -18,6 +18,14 @@ except Exception:
 # ==== OpenAI SDK (tanpa custom httpx) ====
 from openai import OpenAI
 
+# ==== Database ====
+try:
+    from database import get_db, get_all_lead_types, create_leadchatbot, test_connection
+    DATABASE_AVAILABLE = True
+except Exception as e:
+    DATABASE_AVAILABLE = False
+    logging.warning(f"Database not available: {e}")
+
 # ========================
 # Build / Version metadata
 # ========================
@@ -44,6 +52,8 @@ PREWARM_ST          = os.getenv("PREWARM_ST", "1") in ("1", "true", "True")
 EXECUTION_MODE      = os.getenv("EXECUTION_MODE", "DRYRUN").upper()
 CRM_API_URL         = os.getenv("CRM_API_URL", "")
 CRM_API_KEY         = os.getenv("CRM_API_KEY", "")
+
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 
 # ========================
 # App & CORS
@@ -602,18 +612,171 @@ async def ai_answer(req: AIRequest):
         logging.exception("ai_answer error")
         return {"answer": "Dazu habe ich keine gesicherte Information. Ich kann dich gerne mit unserem Team verbinden.", "sources": [], "confidence": 0.0}
 
-@app.post("/lead")
-async def push_lead(payload: LeadPayload):
-    if EXECUTION_MODE != "LIVE" or not CRM_API_URL:
-        logging.warning("[LEAD] DRY or CRM not configured — storing as accepted")
-        return {"status": "accepted", "mode": EXECUTION_MODE, "crm": "not_configured"}
+@app.get("/leadtype")
+async def get_lead_types():
+    """
+    Get all available lead types from the database.
+    This is used by the chatbot frontend to populate the lead type dropdown.
+    """
+    if not DATABASE_AVAILABLE:
+        return {"error": "Database not available", "lead_types": []}
+
     try:
-        import requests
-        headers = {"Authorization": f"Bearer {CRM_API_KEY}", "Content-Type": "application/json"}
-        r = requests.post(CRM_API_URL, headers=headers, json=payload.dict())
-        return {"status": "ok", "crm_status": r.status_code, "crm_body": r.text}
+        db = next(get_db())
+        try:
+            lead_types = get_all_lead_types(db)
+            return {
+                "lead_types": [
+                    {
+                        "id": lt.id,
+                        "key": lt.key,
+                        "name": lt.name,
+                    }
+                    for lt in lead_types
+                ]
+            }
+        finally:
+            db.close()
     except Exception as e:
-        logging.exception("CRM push failed")
+        logging.exception("Error fetching lead types")
+        return {"error": str(e), "lead_types": []}
+
+
+@app.get("/places/autocomplete")
+async def places_autocomplete(input: str = Query(..., min_length=1)):
+    """
+    Google Places API autocomplete proxy.
+    Returns address predictions for German addresses.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+                params={
+                    "input": input,
+                    "key": GOOGLE_PLACES_API_KEY,
+                    "components": "country:de",
+                    "types": "address",
+                    "language": "de"
+                }
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logging.exception("Google Places autocomplete error")
+        return {"status": "error", "predictions": [], "error": str(e)}
+
+
+@app.get("/places/details")
+async def places_details(place_id: str = Query(...)):
+    """
+    Google Places API place details proxy.
+    Returns detailed information about a specific place including geometry and address components.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                "https://maps.googleapis.com/maps/api/place/details/json",
+                params={
+                    "place_id": place_id,
+                    "key": GOOGLE_PLACES_API_KEY,
+                    "fields": "formatted_address,address_components,geometry",
+                    "language": "de"
+                }
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logging.exception("Google Places details error")
+        return {"status": "error", "result": {}, "error": str(e)}
+
+
+class ChatbotLeadPayload(BaseModel):
+    """Payload for chatbot lead submission"""
+    # Contact info (required)
+    gender: str
+    first_name: str
+    last_name: str
+    email: str
+    phone1: str
+
+    # Contact info (optional)
+    company: Optional[str] = None
+    phone2: Optional[str] = None
+    phone3: Optional[str] = None
+
+    # Address (required)
+    street_and_number: str
+    zip_and_city: str
+    province: str
+    latitude: float
+    longitude: float
+
+    # Lead metadata (required)
+    lead_type_id: int
+    notes: str
+
+    # Lead metadata (optional)
+    session_id: Optional[str] = None
+
+
+@app.post("/lead")
+async def push_lead(payload: ChatbotLeadPayload):
+    """
+    Create a new lead from chatbot.
+    Inserts into LeadChatbot table directly (no auth needed).
+    A worker/cron will process it later into the Lead table.
+    """
+    if not DATABASE_AVAILABLE:
+        logging.error("[LEAD] Database not available")
+        return {"status": "error", "error": "Database not available"}
+
+    try:
+        db = next(get_db())
+        try:
+            # Create LeadChatbot entry with hardcoded source
+            lead_chatbot = create_leadchatbot(
+                db,
+                gender=payload.gender,
+                first_name=payload.first_name,
+                last_name=payload.last_name,
+                company=payload.company,
+                street_and_number=payload.street_and_number,
+                zip_and_city=payload.zip_and_city,
+                province=payload.province,
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+                email=payload.email,
+                phone1=payload.phone1,
+                phone2=payload.phone2,
+                phone3=payload.phone3,
+                lead_type_id=payload.lead_type_id,
+                source="Wattson/Chatbot",  # Hardcoded source
+                session_id=payload.session_id,
+                notes=payload.notes,
+            )
+
+            log.info(json.dumps({
+                "event": "lead_created",
+                "lead_chatbot_id": lead_chatbot.id,
+                "email": payload.email,
+                "lead_type_id": payload.lead_type_id,
+            }))
+
+            return {
+                "status": "ok",
+                "lead_chatbot_id": lead_chatbot.id,
+                "message": "Lead stored successfully. Will be processed by cron job."
+            }
+        finally:
+            db.close()
+
+    except Exception as e:
+        logging.exception("Error creating lead")
         return {"status": "error", "error": str(e)}
 
 @app.post("/track")
